@@ -89,7 +89,7 @@ spec:
         - name: ghcr-secret
       containers:
         - name: metrics-exporter
-          image: ghcr.io/faenx/dremio-keda-exporter:2026.05.0
+          image: ghcr.io/rusha-corp/dremio-keda-exporter:2026.05.0
           imagePullPolicy: Always
           ports:
             - containerPort: 5001
@@ -149,8 +149,8 @@ flake8 . --config=.flake8
 ### Build Docker Image
 
 ```bash
-docker build -t ghcr.io/faenx/dremio-keda-exporter:2026.05.0 .
-docker push ghcr.io/faenx/dremio-keda-exporter:2026.05.0
+docker build -t ghcr.io/rusha-corp/dremio-keda-exporter:2026.05.0 .
+docker push ghcr.io/rusha-corp/dremio-keda-exporter:2026.05.0
 ```
 
 ## License
