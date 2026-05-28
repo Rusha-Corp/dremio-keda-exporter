@@ -1,31 +1,34 @@
 """Dremio metrics exporter for KEDA-driven autoscaling.
 
 Exposes Dremio application-aware metrics as a JSON HTTP endpoint that
-KEDA's metrics-api scaler polls to replace the autoscale/autostop CronJobs.
+KEDA's metrics-api scaler polls to drive executor StatefulSet scaling.
 
 Metrics exposed at GET /json
 ─────────────────────────────────────────────────────────────────────────────
- active_user_jobs     Running/queued jobs from human users and platform
-                      service accounts (excludes $dremio$, ACCELERATION,
-                      dremio.ops — the ops/system accounts).
- active_small_jobs    User jobs with planner_estimated_cost <= threshold.
- active_large_jobs    User jobs with planner_estimated_cost > threshold.
- active_reflection_jobs  Running jobs from system accounts ($dremio$, etc.).
- registered_executors Executors registered with Dremio coordinator.
- executor_desired_small  Desired StatefulSet replica count for small tier.
- executor_desired_large  Desired StatefulSet replica count for large tier.
+ executor_desired_small  Desired replica count for dremio-executor-small.
+ executor_desired_large  Desired replica count for dremio-executor-large.
+ active_small_jobs       Jobs completed recently on SMALL queue (informational).
+ active_large_jobs       Jobs completed recently on LARGE queue (informational).
+ registered_executors    Executors visible in sys.nodes (informational).
 
-Scale gate logic (per tier)
-────────────────────────────
-SMALL tier (user + reflection jobs):
-  • active_small_jobs > 0 or reflection_jobs > 0 → hold at current
-  • idle but within SCALE_DOWN_GRACE_SECS → hold at current (drain fragments)
-  • idle past grace period → 0 (scale to zero)
+Scale-down gate logic (per tier)
+──────────────────────────────────
+The exporter never knows about in-flight jobs directly (/apiv2/jobs only
+returns terminal jobs). Instead it uses three signals, highest priority first:
 
-LARGE tier (user jobs only):
-  • active_large_jobs > 0 → hold at current
-  • idle but within SCALE_DOWN_GRACE_SECS → hold at current (drain fragments)
-  • idle past grace period → 0 (scale to zero)
+ 1. Scale-request annotation  dremio.io/scale-requested-at on the StatefulSet,
+                               written by ElasticResourceAllocator when it needs
+                               to cold-start executors. Held for SCALE_DOWN_GRACE_SECS.
+ 2. Ready-replica window       From the moment readyReplicas first goes > 0, hold
+                               desired = spec_replicas for SCALE_DOWN_GRACE_SECS.
+                               Covers any in-flight job that started after cold-start.
+ 3. Recent-job history         /apiv2/jobs endTime recency — any job whose endTime
+                               falls within SCALE_DOWN_GRACE_SECS resets the idle
+                               timer. /api/v3/job/{id} gives queueName for tier routing.
+
+When any signal fires, the hold logic is: return current spec_replicas (never
+force it up or down beyond what's already running). KEDA's own cooldownPeriod
+provides an additional buffer after desired first drops to 0.
 """
 
 import json
@@ -33,10 +36,10 @@ import logging
 import os
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 from urllib.request import Request, urlopen
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 
 from flask import Flask, jsonify
 
@@ -49,18 +52,12 @@ app = Flask(__name__)
 DREMIO_URL = os.environ.get(
     "DREMIO_URL", "http://dremio-coordinator-hs.dremio.svc.cluster.local:9047"
 )
-DREMIO_LIVENESS_URL = os.environ.get(
-    "DREMIO_LIVENESS_URL",
-    "http://dremio-coordinator-liveness.dremio.svc.cluster.local:45679/metrics",
-)
 DREMIO_USERNAME = os.environ.get("DREMIO_USERNAME", "")
 DREMIO_PASSWORD = os.environ.get("DREMIO_PASSWORD", "")
-MIN_EXECUTORS = int(os.environ.get("MIN_EXECUTORS", "0"))
-MAX_EXECUTORS = int(os.environ.get("MAX_EXECUTORS", "4"))
-SCALE_DOWN_GRACE_SECS = int(os.environ.get("SCALE_DOWN_GRACE_SECS", "120"))
+SCALE_DOWN_GRACE_SECS = int(os.environ.get("SCALE_DOWN_GRACE_SECS", "1800"))
 
-_SYSTEM_USERS = ["$dremio$", "ACCELERATION", "dremio.ops"]
-_TERMINAL_STATES = {"COMPLETED", "FAILED", "CANCELED", "CANCELLATION_REQUESTED"}
+_LARGE_QUEUES = {"LARGE", "REFLECTION_LARGE"}
+_SMALL_QUEUES = {"SMALL", "REFLECTION_SMALL", "LOW_COST"}
 
 # ── Dremio REST client ─────────────────────────────────────────────────────────
 
@@ -87,97 +84,130 @@ class DremioClient:
         self._token = json.loads(urlopen(req, timeout=10).read())["token"]
         self._token_ts = time.time()
 
-    def list_jobs(self) -> list[dict]:
-        """List active (non-terminal) jobs via REST API."""
+    def _auth_headers(self) -> dict:
         self._ensure_token()
-        headers = {
-            "Authorization": f"_dremio{self._token}",
-            "Content-Type": "application/json",
-        }
+        return {"Authorization": f"_dremio{self._token}", "Content-Type": "application/json"}
+
+    def list_jobs(self, limit: int = 200) -> list[dict]:
+        """Return recent jobs (terminal and non-terminal) from job history."""
+        headers = self._auth_headers()
         try:
-            resp = urlopen(Request(f"{self._url}/apiv2/jobs", headers=headers), timeout=30)
-            data = json.loads(resp.read())
-            return data.get("jobs", [])
+            resp = urlopen(
+                Request(f"{self._url}/apiv2/jobs?limit={limit}", headers=headers), timeout=15
+            )
+            return json.loads(resp.read()).get("jobs", [])
         except HTTPError as exc:
             logger.warning("apiv2/jobs HTTP %s", exc.code)
             raise
 
-    def count_nodes(self) -> int:
-        """Count registered executors via sys.nodes (requires executors to run).
+    def get_job_queue(self, job_id: str) -> str:
+        """Return queueName for a job ('SMALL', 'LARGE', etc.) or '' on failure."""
+        headers = self._auth_headers()
+        try:
+            resp = urlopen(
+                Request(f"{self._url}/api/v3/job/{job_id}", headers=headers), timeout=5
+            )
+            return json.loads(resp.read()).get("queueName", "")
+        except Exception as exc:
+            logger.debug("get_job_queue(%s) failed: %s", job_id, exc)
+            return ""
 
-        This is informational only - if executors aren't running, return 0.
-        The KEDA ScaledObjects use executor_desired_small/large for scaling, not this count.
-        """
-        self._ensure_token()
-        headers = {
-            "Authorization": f"_dremio{self._token}",
-            "Content-Type": "application/json",
-        }
+    def count_nodes(self) -> int:
+        """Count registered executors (informational; requires executors running)."""
+        headers = self._auth_headers()
         try:
             sql = "SELECT COUNT(*) AS cnt FROM sys.nodes WHERE is_executor = true"
-            req = Request(
-                f"{self._url}/api/v3/sql",
-                data=json.dumps({"sql": sql}).encode(),
-                headers=headers,
+            resp = urlopen(
+                Request(
+                    f"{self._url}/api/v3/sql",
+                    data=json.dumps({"sql": sql}).encode(),
+                    headers=headers,
+                ),
+                timeout=5,
             )
-            resp = urlopen(req, timeout=5)
-            data = json.loads(resp.read())
-            job_id = data.get("id")
+            job_id = json.loads(resp.read()).get("id")
             if not job_id:
                 return 0
-            for _ in range(5):
-                time.sleep(0.3)
-                req = Request(f"{self._url}/api/v3/job/{job_id}", headers=headers)
-                job_state = json.loads(urlopen(req, timeout=5).read()).get("jobState", "")
-                if job_state == "COMPLETED":
-                    req = Request(f"{self._url}/api/v3/job/{job_id}/results", headers=headers)
-                    result = json.loads(urlopen(req, timeout=5).read())
-                    rows = result.get("rows", [])
+            for _ in range(6):
+                time.sleep(0.5)
+                detail = json.loads(
+                    urlopen(Request(f"{self._url}/api/v3/job/{job_id}", headers=headers), timeout=5).read()
+                )
+                state = detail.get("jobState", "")
+                if state == "COMPLETED":
+                    rows = json.loads(
+                        urlopen(
+                            Request(f"{self._url}/api/v3/job/{job_id}/results", headers=headers), timeout=5
+                        ).read()
+                    ).get("rows", [])
                     return int(rows[0]["cnt"]) if rows else 0
-                if job_state == "FAILED":
+                if state in ("FAILED", "CANCELED"):
                     return 0
             return 0
         except Exception as exc:
-            logger.warning("count_nodes failed: %s", exc)
+            logger.debug("count_nodes failed: %s", exc)
             return 0
 
 
-class DremioLivenessClient:
-    """Scrapes Dremio liveness /metrics endpoint for gauge values."""
-
-    def __init__(self, liveness_url: str):
-        self._url = liveness_url.rstrip("/")
-
-    def get_desired(self) -> tuple[int, int]:
-        """Get elastic_desired_small and elastic_desired_large from Prometheus metrics."""
-        resp = urlopen(self._url, timeout=5).read().decode()
-        small = large = 0
-        for line in resp.splitlines():
-            if line.startswith("elastic_desired_small "):
-                small = int(float(line.split()[1]))
-            elif line.startswith("elastic_desired_large "):
-                large = int(float(line.split()[1]))
-        return small, large
+# ── Kubernetes state collector ─────────────────────────────────────────────────
 
 
-# ── Metrics collector ──────────────────────────────────────────────────────────
+class K8sStateCollector:
+    """Reads StatefulSet spec replicas, ready replicas, and annotations."""
+
+    def __init__(self):
+        self._available = False
+        self._namespace = os.environ.get("NAMESPACE", "dremio")
+        try:
+            from kubernetes import config as k8s_config, client
+            k8s_config.load_incluster_config()
+            self._apps = client.AppsV1Api()
+            self._available = True
+        except Exception as exc:
+            logger.warning("K8s client not available: %s", exc)
+
+    def get_statefulset_info(self, name: str) -> tuple[int, int, float]:
+        """Return (spec_replicas, ready_replicas, scale_requested_at_epoch).
+
+        scale_requested_at_epoch comes from the dremio.io/scale-requested-at
+        annotation written by ElasticResourceAllocator before cold-starting pods.
+        Returns 0.0 if the annotation is absent or unparseable.
+        """
+        if not self._available:
+            return 0, 0, 0.0
+        try:
+            sts = self._apps.read_namespaced_stateful_set(name, self._namespace)
+            spec_replicas = sts.spec.replicas or 0
+            ready_replicas = (sts.status.ready_replicas or 0) if sts.status else 0
+            annotations = sts.metadata.annotations or {}
+            try:
+                scale_ts = int(annotations.get("dremio.io/scale-requested-at", "0")) / 1000.0
+            except (ValueError, TypeError):
+                scale_ts = 0.0
+            return spec_replicas, ready_replicas, scale_ts
+        except Exception as exc:
+            logger.warning("Failed to read StatefulSet %s: %s", name, exc)
+            return 0, 0, 0.0
+
+
+# ── Metrics snapshot ───────────────────────────────────────────────────────────
 
 
 @dataclass
 class MetricsSnapshot:
-    active_user_jobs: int = 0
     active_small_jobs: int = 0
     active_large_jobs: int = 0
+    active_user_jobs: int = 0
     active_reflection_jobs: int = 0
     registered_executors: int = 0
-    executor_desired_small: int = MIN_EXECUTORS
-    executor_desired_large: int = MIN_EXECUTORS
+    executor_desired_small: int = 0
+    executor_desired_large: int = 0
 
     def to_dict(self) -> dict:
         return {
-            "active_user_jobs": self.active_user_jobs,
             "active_small_jobs": self.active_small_jobs,
             "active_large_jobs": self.active_large_jobs,
+            "active_user_jobs": self.active_user_jobs,
             "active_reflection_jobs": self.active_reflection_jobs,
             "registered_executors": self.registered_executors,
             "executor_desired_small": self.executor_desired_small,
@@ -185,167 +215,165 @@ class MetricsSnapshot:
         }
 
 
-# ── Kubernetes state collector ─────────────────────────────────────────────────
-
-
-class K8sStateCollector:
-    """Fetches current StatefulSet replica counts."""
-
-    def __init__(self):
-        try:
-            from kubernetes import config as k8s_config, client
-            k8s_config.load_incluster_config()
-            self._apps = client.AppsV1Api()
-            self._namespace = os.environ.get("NAMESPACE", "dremio")
-            self._client_available = True
-        except Exception as e:
-            logger.warning("K8s client not available: %s", e)
-            self._client_available = False
-            self._namespace = "dremio"
-
-    def get_replicas(self, name: str) -> int:
-        """Get current replica count for a StatefulSet."""
-        if not self._client_available:
-            return 0
-        try:
-            sts = self._apps.read_namespaced_stateful_set(name, self._namespace)
-            return sts.spec.replicas or 0
-        except Exception as e:
-            logger.warning("Failed to read statefulset %s: %s", name, e)
-            return 0
-
-
 # ── Main metrics collector ─────────────────────────────────────────────────────
 
 
 class DremioMetricsCollector:
-    """Orchestrates all collectors and computes executor_desired counts."""
+    """Computes executor_desired counts from job history and K8s state."""
 
     def __init__(self):
         self._dremio = DremioClient(DREMIO_URL, DREMIO_USERNAME, DREMIO_PASSWORD)
-        self._liveness = DremioLivenessClient(DREMIO_LIVENESS_URL)
         self._k8s = K8sStateCollector()
         self._cache: Optional[MetricsSnapshot] = None
-        self._cache_ts: float = 0
-        # Initialize to now so the grace period starts from startup, not epoch
-        self._last_active_small: float = time.time()
-        self._last_active_large: float = time.time()
+
+        # Grace timers — 0 means "never seen activity"; grace is considered expired.
+        # Populated on first _collect() call from job history.
+        self._last_active_small: float = 0.0
+        self._last_active_large: float = 0.0
+
+        # Track when each tier's executors first became ready in this window.
+        self._small_became_ready_at: Optional[float] = None
+        self._large_became_ready_at: Optional[float] = None
+
+        # Cache: job_id → queueName, pruned each cycle.
+        self._queue_cache: dict[str, str] = {}
 
     def get(self) -> MetricsSnapshot:
-        """Return last cached snapshot immediately (never blocks)."""
         return self._cache if self._cache else MetricsSnapshot()
 
     def refresh(self) -> None:
-        """Collect fresh metrics and update cache. Called from background thread."""
         snap = self._collect()
         self._cache = snap
-        self._cache_ts = time.time()
         logger.info("Metrics: %s", snap.to_dict())
 
     def _collect(self) -> MetricsSnapshot:
         snap = MetricsSnapshot()
+        now = time.time()
+        now_ms = int(now * 1000)
+        grace_ms = SCALE_DOWN_GRACE_SECS * 1000
 
-        # ── Dremio job metrics via REST (no executor needed) ───────────────
+        # ── K8s StatefulSet state ─────────────────────────────────────────
+        spec_small, ready_small, scale_req_small = self._k8s.get_statefulset_info("dremio-executor-small")
+        spec_large, ready_large, scale_req_large = self._k8s.get_statefulset_info("dremio-executor-large")
+
+        # ── Ready-replica window tracking ─────────────────────────────────
+        # From the moment readyReplicas first becomes > 0, we start a grace window.
+        # This covers in-flight jobs that started right after executor cold-start,
+        # before any job appears in the completed-jobs history.
+        if ready_small > 0:
+            if self._small_became_ready_at is None:
+                self._small_became_ready_at = now
+        else:
+            self._small_became_ready_at = None
+
+        if ready_large > 0:
+            if self._large_became_ready_at is None:
+                self._large_became_ready_at = now
+        else:
+            self._large_became_ready_at = None
+
+        # ── Job history: endTime recency per tier ─────────────────────────
+        # /apiv2/jobs returns terminal (COMPLETED/FAILED) jobs only.
+        # We scan for jobs whose endTime falls within the grace window, then
+        # look up their queueName to classify the tier.
+        recently_active_small = False
+        recently_active_large = False
+        recent_small_jobs = 0
+        recent_large_jobs = 0
+
         try:
-            jobs = self._dremio.list_jobs()
-            user_jobs = 0
-            reflection_jobs = 0
+            jobs = self._dremio.list_jobs(limit=200)
+
+            # Prune queue cache: drop entries older than 2x grace window.
+            cutoff_ms = now_ms - 2 * grace_ms
+            self._queue_cache = {
+                jid: q for jid, q in self._queue_cache.items()
+                if any(j["id"] == jid and j.get("endTime", 0) > cutoff_ms for j in jobs)
+            }
+
             for job in jobs:
-                # Skip terminal (completed/failed/canceled) jobs
-                if job.get("isComplete", False) or job.get("state", "") in _TERMINAL_STATES:
-                    continue
-                user = job.get("user", "")
-                if user in _SYSTEM_USERS:
-                    reflection_jobs += 1
-                else:
-                    user_jobs += 1
-            snap.active_user_jobs = user_jobs
-            snap.active_small_jobs = user_jobs
-            snap.active_large_jobs = user_jobs
-            snap.active_reflection_jobs = reflection_jobs
+                end_time_ms = job.get("endTime", 0)
+                if not end_time_ms or (now_ms - end_time_ms) > grace_ms:
+                    continue  # outside grace window or no endTime
+                jid = job["id"]
+                if jid not in self._queue_cache:
+                    queue = self._dremio.get_job_queue(jid)
+                    if queue:
+                        self._queue_cache[jid] = queue
+                queue = self._queue_cache.get(jid, "")
+                if queue in _LARGE_QUEUES:
+                    recently_active_large = True
+                    recent_large_jobs += 1
+                elif queue in _SMALL_QUEUES or queue == "":
+                    recently_active_small = True
+                    recent_small_jobs += 1
+
+            snap.active_small_jobs = recent_small_jobs
+            snap.active_large_jobs = recent_large_jobs
+            snap.active_user_jobs = recent_small_jobs + recent_large_jobs
             snap.registered_executors = self._dremio.count_nodes()
         except TimeoutError:
-            logger.warning("Dremio REST timed out (executor saturated) — fail-open")
-            snap.active_user_jobs = 99
+            logger.warning("Dremio REST timed out — fail-open, holding current desired")
+            # On timeout keep existing timers alive; don't reset to 0.
+            recently_active_small = True
+            recently_active_large = True
         except Exception as exc:
             logger.warning("Dremio unavailable: %s", exc)
 
-        # ── Update last-active timestamps ────────────────────────────────
-        now = time.time()
-        if snap.active_small_jobs > 0 or snap.active_reflection_jobs > 0:
+        # ── Update grace timers from all signals ──────────────────────────
+        # Signal 1: recent completed jobs in history
+        if recently_active_small:
             self._last_active_small = now
-        if snap.active_large_jobs > 0:
+        if recently_active_large:
             self._last_active_large = now
 
-        # ── Get desired counts from Dremio's liveness metrics ────────────
-        try:
-            desired_small, desired_large = self._liveness.get_desired()
-        except Exception as exc:
-            logger.warning("liveness get_desired failed: %s", exc)
-            desired_small, desired_large = 0, 0
+        # Signal 2: ready-replica window (executor running, might have in-flight job)
+        if self._small_became_ready_at and (now - self._small_became_ready_at) < SCALE_DOWN_GRACE_SECS:
+            self._last_active_small = now
+        if self._large_became_ready_at and (now - self._large_became_ready_at) < SCALE_DOWN_GRACE_SECS:
+            self._last_active_large = now
 
-        # ── Current StatefulSet replica counts ───────────────────────────
-        current_small = self._k8s.get_replicas("dremio-executor-small")
-        current_large = self._k8s.get_replicas("dremio-executor-large")
+        # Signal 3: scale-request annotation written by ElasticResourceAllocator.
+        # Also bump spec floor to 1 so _compute_desired returns ≥ 1 even if KEDA
+        # already deactivated spec.replicas to 0 before the exporter could respond.
+        if scale_req_small and (now - scale_req_small) < SCALE_DOWN_GRACE_SECS:
+            self._last_active_small = now
+            spec_small = max(spec_small, 1)
+        if scale_req_large and (now - scale_req_large) < SCALE_DOWN_GRACE_SECS:
+            self._last_active_large = now
+            spec_large = max(spec_large, 1)
 
-        # ── Compute desired counts ───────────────────────────────────────
-        snap.executor_desired_small = self._compute_desired_small(
-            current_small, snap.active_small_jobs, snap.active_reflection_jobs, desired_small
-        )
-        snap.executor_desired_large = self._compute_desired_large(
-            current_large, snap.active_large_jobs, desired_large
-        )
+        # ── Compute desired replica counts ────────────────────────────────
+        snap.executor_desired_small = self._compute_desired("small", spec_small, self._last_active_small)
+        snap.executor_desired_large = self._compute_desired("large", spec_large, self._last_active_large)
         return snap
 
-    def _compute_desired_small(
-        self, current: int, small_jobs: int, reflection_jobs: int, dremio_desired: int
-    ) -> int:
-        now = time.time()
-        if small_jobs > 0 or reflection_jobs > 0:
-            return max(current, max(dremio_desired, 1))
-        secs_idle = now - self._last_active_small
-        if current > 0 and secs_idle < SCALE_DOWN_GRACE_SECS:
-            logger.info(
-                "small tier idle for %.0fs/%ds, holding at %d",
-                secs_idle, SCALE_DOWN_GRACE_SECS, current,
-            )
-            return current
-        if current > 0:
-            logger.info("small tier idle for %.0fs (past grace), scaling to 0", secs_idle)
-        return 0
+    def _compute_desired(self, tier: str, spec_replicas: int, last_active: float) -> int:
+        """Hold at spec_replicas while within grace; return 0 when idle past grace.
 
-    def _compute_desired_large(self, current: int, large_jobs: int, dremio_desired: int) -> int:
-        """Compute desired large executor count.
-
-        dremio_desired comes from the liveness /metrics endpoint (elastic_desired_large).
-        Dremio's ElasticResourceAllocator does not publish this metric, so it is always 0.
-        When large_jobs > 0 we ensure at least 1 large executor is desired regardless.
+        Never forces replicas higher than what's already spec'd — that is
+        ElasticResourceAllocator's job via the annotation + direct scale call.
+        Holding spec_replicas prevents KEDA from racing the allocator to 0.
         """
-        now = time.time()
-        if large_jobs > 0:
-            # dremio_desired is always 0 (metric not emitted by Dremio) — use 1 as floor
-            return max(current, max(dremio_desired, 1))
-        secs_idle = now - self._last_active_large
-        if current > 0 and secs_idle < SCALE_DOWN_GRACE_SECS:
-            logger.info(
-                "large tier idle for %.0fs/%ds, holding at %d",
-                secs_idle, SCALE_DOWN_GRACE_SECS, current,
-            )
-            return current
-        if current > 0:
-            logger.info("large tier idle for %.0fs (past grace), scaling to 0", secs_idle)
+        secs_idle = time.time() - last_active
+        if last_active > 0 and secs_idle < SCALE_DOWN_GRACE_SECS:
+            if spec_replicas > 0:
+                logger.info(
+                    "%s tier idle %.0fs/%ds, holding at %d",
+                    tier, secs_idle, SCALE_DOWN_GRACE_SECS, spec_replicas,
+                )
+            return spec_replicas  # hold — could be 0 if not yet scaled up
+        if spec_replicas > 0:
+            logger.info("%s tier idle %.0fs (past grace), scaling to 0", tier, secs_idle)
         return 0
 
 
-# ── Singleton ──────────────────────────────────────────────────────────────────
+# ── Singleton and background thread ───────────────────────────────────────────
 _collector = DremioMetricsCollector()
-
-# ── Background collection thread ───────────────────────────────────────────────
 _bg_started = threading.Event()
 
 
 def _bg_collect_loop() -> None:
-    """Runs in a daemon thread inside each gunicorn worker process."""
     while True:
         try:
             _collector.refresh()
@@ -354,14 +382,16 @@ def _bg_collect_loop() -> None:
         time.sleep(15)
 
 
-# ── Flask routes ───────────────────────────────────────────────────────────────
-
-
 @app.before_request
 def _ensure_bg_thread() -> None:
-    """Start the background collection thread on the first request to this worker."""
     if not _bg_started.is_set():
         _bg_started.set()
+        # Prime the cache synchronously before starting background loop
+        # so the first KEDA poll gets real data, not a zero snapshot.
+        try:
+            _collector.refresh()
+        except Exception as exc:
+            logger.warning("Initial collect failed: %s", exc)
         t = threading.Thread(target=_bg_collect_loop, daemon=True)
         t.start()
 
