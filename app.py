@@ -312,12 +312,19 @@ class DremioMetricsCollector:
             return current
         if current > 0:
             logger.info("small tier idle for %.0fs (past grace), scaling to 0", secs_idle)
-            return 0
+        return 0
 
     def _compute_desired_large(self, current: int, large_jobs: int, dremio_desired: int) -> int:
+        """Compute desired large executor count.
+
+        dremio_desired comes from the liveness /metrics endpoint (elastic_desired_large).
+        Dremio's ElasticResourceAllocator does not publish this metric, so it is always 0.
+        When large_jobs > 0 we ensure at least 1 large executor is desired regardless.
+        """
         now = time.time()
         if large_jobs > 0:
-            return max(current, dremio_desired)
+            # dremio_desired is always 0 (metric not emitted by Dremio) — use 1 as floor
+            return max(current, max(dremio_desired, 1))
         secs_idle = now - self._last_active_large
         if current > 0 and secs_idle < SCALE_DOWN_GRACE_SECS:
             logger.info(
@@ -327,7 +334,7 @@ class DremioMetricsCollector:
             return current
         if current > 0:
             logger.info("large tier idle for %.0fs (past grace), scaling to 0", secs_idle)
-            return 0
+        return 0
 
 
 # ── Singleton ──────────────────────────────────────────────────────────────────
