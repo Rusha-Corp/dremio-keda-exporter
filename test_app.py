@@ -5,6 +5,13 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 
+def _login_response():
+    """Create a mock response that returns a login token."""
+    mock = MagicMock()
+    mock.read.return_value = json.dumps({"token": "test_token"}).encode()
+    return mock
+
+
 class TestDremioClient(unittest.TestCase):
     """Tests for DremioClient class."""
 
@@ -25,9 +32,7 @@ class TestDremioClient(unittest.TestCase):
     @patch("app.urlopen")
     def test_ensure_token(self, mock_urlopen):
         """Test token caching and refresh."""
-        mock_response = MagicMock()
-        mock_response.read.return_value = json.dumps({"token": "test_token"}).encode()
-        mock_urlopen.return_value = mock_response
+        mock_urlopen.return_value = _login_response()
 
         # First call - should fetch token
         self.client._ensure_token()
@@ -41,15 +46,16 @@ class TestDremioClient(unittest.TestCase):
     @patch("app.urlopen")
     def test_list_jobs_success(self, mock_urlopen):
         """Test successful job listing."""
-        mock_response = MagicMock()
-        mock_response.read.return_value = json.dumps({
+        login_resp = _login_response()
+        jobs_resp = MagicMock()
+        jobs_resp.read.return_value = json.dumps({
             "jobs": [
                 {"id": "1", "user": "alice", "state": "RUNNING"},
                 {"id": "2", "user": "$dremio$", "state": "COMPLETED"},
             ],
             "next": None,
         }).encode()
-        mock_urlopen.return_value = mock_response
+        mock_urlopen.side_effect = [login_resp, jobs_resp]
 
         jobs = self.client.list_jobs()
         self.assertEqual(len(jobs), 2)
@@ -59,9 +65,12 @@ class TestDremioClient(unittest.TestCase):
     @patch("app.urlopen")
     def test_list_jobs_empty(self, mock_urlopen):
         """Test empty job list."""
-        mock_response = MagicMock()
-        mock_response.read.return_value = json.dumps({"jobs": [], "next": None}).encode()
-        mock_urlopen.return_value = mock_response
+        login_resp = _login_response()
+        jobs_resp = MagicMock()
+        jobs_resp.read.return_value = json.dumps(
+            {"jobs": [], "next": None}
+        ).encode()
+        mock_urlopen.side_effect = [login_resp, jobs_resp]
 
         jobs = self.client.list_jobs()
         self.assertEqual(jobs, [])
@@ -69,12 +78,13 @@ class TestDremioClient(unittest.TestCase):
     @patch("app.urlopen")
     def test_list_jobs_with_next(self, mock_urlopen):
         """Test job list with pagination."""
-        mock_response = MagicMock()
-        mock_response.read.return_value = json.dumps({
+        login_resp = _login_response()
+        jobs_resp = MagicMock()
+        jobs_resp.read.return_value = json.dumps({
             "jobs": [{"id": "1", "user": "alice"}],
             "next": "/jobs/?offset=100",
         }).encode()
-        mock_urlopen.return_value = mock_response
+        mock_urlopen.side_effect = [login_resp, jobs_resp]
 
         jobs = self.client.list_jobs()
         self.assertEqual(len(jobs), 1)
@@ -82,28 +92,42 @@ class TestDremioClient(unittest.TestCase):
     @patch("app.urlopen")
     def test_count_nodes_success(self, mock_urlopen):
         """Test successful node count."""
-        # First call: submit query
-        mock_submit_response = MagicMock()
-        mock_submit_response.read.return_value = json.dumps({"id": "test-job-id"}).encode()
-
-        # Second call: check job status (COMPLETED)
-        mock_status_response = MagicMock()
-        mock_status_response.read.return_value = json.dumps({"jobState": "COMPLETED"}).encode()
-
-        # Third call: get results
-        mock_results_response = MagicMock()
-        mock_results_response.read.return_value = json.dumps({
-            "rows": [{"cnt": 3}],
-        }).encode()
-
-        # Fourth call: another status check (for count_nodes polling)
-        mock_urlopen.side_effect = [mock_submit_response, mock_status_response, mock_results_response]
-
-        self.client._token = "test_token"
-        self.client._token_ts = 0  # Force refresh
+        login_resp = _login_response()
+        submit_resp = MagicMock()
+        submit_resp.read.return_value = json.dumps(
+            {"id": "test-job-id"}
+        ).encode()
+        status_resp = MagicMock()
+        status_resp.read.return_value = json.dumps(
+            {"jobState": "COMPLETED"}
+        ).encode()
+        results_resp = MagicMock()
+        results_resp.read.return_value = json.dumps(
+            {"rows": [{"cnt": 3}]}
+        ).encode()
+        mock_urlopen.side_effect = [
+            login_resp, submit_resp, status_resp, results_resp
+        ]
 
         count = self.client.count_nodes()
         self.assertEqual(count, 3)
+
+    @patch("app.urlopen")
+    def test_count_nodes_failed(self, mock_urlopen):
+        """Test node count when query fails."""
+        login_resp = _login_response()
+        submit_resp = MagicMock()
+        submit_resp.read.return_value = json.dumps(
+            {"id": "test-job-id"}
+        ).encode()
+        status_resp = MagicMock()
+        status_resp.read.return_value = json.dumps(
+            {"jobState": "FAILED"}
+        ).encode()
+        mock_urlopen.side_effect = [login_resp, submit_resp, status_resp]
+
+        count = self.client.count_nodes()
+        self.assertEqual(count, 0)
 
 
 class TestMetricsSnapshot(unittest.TestCase):
