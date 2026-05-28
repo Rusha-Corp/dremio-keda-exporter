@@ -94,7 +94,8 @@ class DremioClient:
         }
         try:
             resp = urlopen(Request(f"{self._url}/apiv2/jobs", headers=headers), timeout=30)
-            return json.loads(resp.read())
+            data = json.loads(resp.read())
+            return data.get("jobs", [])
         except HTTPError as exc:
             logger.warning("apiv2/jobs HTTP %s", exc.code)
             raise
