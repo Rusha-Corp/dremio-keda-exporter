@@ -50,9 +50,11 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Extract tag name
-        id: tag
-        run: echo "version=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+      - name: Extract tag name and lowercase owner
+        id: meta
+        run: |
+          echo "version=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          echo "owner=$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')" >> $GITHUB_OUTPUT
 
       - name: Log in to GHCR
         uses: docker/login-action@v3
@@ -67,5 +69,5 @@ jobs:
           context: .
           push: true
           tags: |
-            ghcr.io/${{ github.repository_owner }}/dremio-keda-exporter:${{ steps.tag.outputs.version }}
-            ghcr.io/${{ github.repository_owner }}/dremio-keda-exporter:latest
+            ghcr.io/${{ steps.meta.outputs.owner }}/dremio-keda-exporter:${{ steps.meta.outputs.version }}
+            ghcr.io/${{ steps.meta.outputs.owner }}/dremio-keda-exporter:latest
