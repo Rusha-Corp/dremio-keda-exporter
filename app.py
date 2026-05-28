@@ -101,17 +101,42 @@ class DremioClient:
             raise
 
     def count_nodes(self) -> int:
-        """Count registered executors via sys.nodes (coordinator-only)."""
+        """Count registered executors via sys.nodes (requires executors to run).
+        
+        This is informational only - if executors aren't running, return 0.
+        The KEDA ScaledObjects use executor_desired_small/large for scaling, not this count.
+        """
         self._ensure_token()
         headers = {
             "Authorization": f"_dremio{self._token}",
             "Content-Type": "application/json",
         }
         try:
-            resp = urlopen(Request(f"{self._url}/api/v3/query", headers=headers), timeout=30)
+            # Use a simple SQL query - will fail if no executors available
+            # but we fail-open and return 0 in that case
+            sql = "SELECT COUNT(*) AS cnt FROM sys.nodes WHERE is_executor = true"
+            req = Request(
+                f"{self._url}/api/v3/sql",
+                data=json.dumps({"sql": sql}).encode(),
+                headers=headers,
+            )
+            resp = urlopen(req, timeout=5)
             data = json.loads(resp.read())
-            for row in data.get("rows", []):
-                return row.get("cnt", 0)
+            job_id = data.get("id")
+            if not job_id:
+                return 0
+            # Poll with very short timeout for immediate result
+            for _ in range(5):
+                time.sleep(0.3)
+                req = Request(f"{self._url}/api/v3/job/{job_id}", headers=headers)
+                job_state = json.loads(urlopen(req, timeout=5).read()).get("jobState", "")
+                if job_state == "COMPLETED":
+                    req = Request(f"{self._url}/api/v3/job/{job_id}/results", headers=headers)
+                    result = json.loads(urlopen(req, timeout=5).read())
+                    rows = result.get("rows", [])
+                    return int(rows[0]["cnt"]) if rows else 0
+                if job_state == "FAILED":
+                    return 0
             return 0
         except Exception as exc:
             logger.warning("count_nodes failed: %s", exc)
