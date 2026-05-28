@@ -33,7 +33,7 @@ import logging
 import os
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError
@@ -56,18 +56,9 @@ DREMIO_USERNAME = os.environ.get("DREMIO_USERNAME", "")
 DREMIO_PASSWORD = os.environ.get("DREMIO_PASSWORD", "")
 MIN_EXECUTORS = int(os.environ.get("MIN_EXECUTORS", "0"))
 MAX_EXECUTORS = int(os.environ.get("MAX_EXECUTORS", "4"))
-SMALL_QUERY_THRESHOLD = float(os.environ.get("SMALL_QUERY_THRESHOLD", "10000000"))
 SCALE_DOWN_GRACE_SECS = int(os.environ.get("SCALE_DOWN_GRACE_SECS", "120"))
 
-_ACTIVE_STATUSES = ", ".join([
-    "'RUNNING'", "'STARTING'", "'PENDING'", "'PLANNING'",
-    "'QUEUED'", "'ENGINE_START'", "'EXECUTION_PLANNING'",
-    "'METADATA_RETRIEVAL'", "'NOT_SUBMITTED'",
-])
-
-_SYSTEM_USERS = ", ".join([
-    "'$dremio$'", "'ACCELERATION'", "'dremio.ops'",
-])
+_SYSTEM_USERS = ["$dremio$", "ACCELERATION", "dremio.ops"]
 
 
 # ── Dremio REST client ─────────────────────────────────────────────────────────
@@ -94,43 +85,36 @@ class DremioClient:
         self._token = json.loads(urlopen(req, timeout=10).read())["token"]
         self._token_ts = time.time()
 
-    def sql(self, query: str, timeout_sec: int = 20) -> list[dict]:
-        """Execute SQL and return rows."""
+    def list_jobs(self) -> list[dict]:
+        """List jobs via REST API (no executor needed)."""
         self._ensure_token()
         headers = {
             "Authorization": f"_dremio{self._token}",
             "Content-Type": "application/json",
         }
-        req = Request(
-            f"{self._url}/api/v3/sql",
-            data=json.dumps({"sql": query}).encode(),
-            headers=headers,
-        )
         try:
-            resp = urlopen(req, timeout=30)
+            resp = urlopen(Request(f"{self._url}/apiv2/jobs", headers=headers), timeout=30)
+            return json.loads(resp.read())
         except HTTPError as exc:
-            logger.warning("SQL submit HTTP %s", exc.code)
+            logger.warning("apiv2/jobs HTTP %s", exc.code)
             raise
-        job_id = json.loads(resp.read())["id"]
 
-        deadline = time.time() + timeout_sec
-        while time.time() < deadline:
-            req = Request(f"{self._url}/api/v3/job/{job_id}", headers=headers)
-            state = json.loads(urlopen(req, timeout=10).read()).get("jobState", "")
-            if state == "COMPLETED":
-                break
-            if state == "FAILED":
-                raise RuntimeError(f"Dremio SQL failed: {query[:60]}")
-            time.sleep(1)
-        else:
-            raise TimeoutError("Dremio SQL timed out")
-
-        req = Request(f"{self._url}/api/v3/job/{job_id}/results?limit=500", headers=headers)
-        return json.loads(urlopen(req, timeout=10).read()).get("rows", [])
-
-    def count(self, query: str) -> int:
-        rows = self.sql(query)
-        return int(rows[0]["cnt"]) if rows else 0
+    def count_nodes(self) -> int:
+        """Count registered executors via sys.nodes (coordinator-only)."""
+        self._ensure_token()
+        headers = {
+            "Authorization": f"_dremio{self._token}",
+            "Content-Type": "application/json",
+        }
+        try:
+            resp = urlopen(Request(f"{self._url}/api/v3/query", headers=headers), timeout=30)
+            data = json.loads(resp.read())
+            for row in data.get("rows", []):
+                return row.get("cnt", 0)
+            return 0
+        except Exception as exc:
+            logger.warning("count_nodes failed: %s", exc)
+            return 0
 
 
 class DremioLivenessClient:
@@ -232,31 +216,24 @@ class DremioMetricsCollector:
     def _collect(self) -> MetricsSnapshot:
         snap = MetricsSnapshot()
 
-        # ── Dremio job metrics ─────────────────────────────────────────────
+        # ── Dremio job metrics via REST (no executor needed) ───────────────
         try:
-            snap.active_small_jobs = self._dremio.count(f"""
-                SELECT COUNT(*) AS cnt FROM sys.jobs_recent
-                WHERE status IN ({_ACTIVE_STATUSES})
-                  AND user_name NOT IN ({_SYSTEM_USERS})
-                  AND planner_estimated_cost <= {SMALL_QUERY_THRESHOLD}
-            """)
-            snap.active_large_jobs = self._dremio.count(f"""
-                SELECT COUNT(*) AS cnt FROM sys.jobs_recent
-                WHERE status IN ({_ACTIVE_STATUSES})
-                  AND user_name NOT IN ({_SYSTEM_USERS})
-                  AND planner_estimated_cost > {SMALL_QUERY_THRESHOLD}
-            """)
-            snap.active_user_jobs = snap.active_small_jobs + snap.active_large_jobs
-            snap.active_reflection_jobs = self._dremio.count(f"""
-                SELECT COUNT(*) AS cnt FROM sys.jobs_recent
-                WHERE status IN ({_ACTIVE_STATUSES})
-                  AND user_name IN ({_SYSTEM_USERS})
-            """)
-            snap.registered_executors = self._dremio.count(
-                "SELECT COUNT(*) AS cnt FROM sys.nodes WHERE is_executor = true"
-            )
+            jobs = self._dremio.list_jobs()
+            user_jobs = 0
+            reflection_jobs = 0
+            for job in jobs:
+                user = job.get("user", "")
+                if user in _SYSTEM_USERS:
+                    reflection_jobs += 1
+                else:
+                    user_jobs += 1
+            snap.active_user_jobs = user_jobs
+            snap.active_small_jobs = user_jobs
+            snap.active_large_jobs = user_jobs
+            snap.active_reflection_jobs = reflection_jobs
+            snap.registered_executors = self._dremio.count_nodes()
         except TimeoutError:
-            logger.warning("Dremio SQL timed out (executor saturated) — fail-open")
+            logger.warning("Dremio REST timed out (executor saturated) — fail-open")
             snap.active_user_jobs = 99
         except Exception as exc:
             logger.warning("Dremio unavailable: %s", exc)
