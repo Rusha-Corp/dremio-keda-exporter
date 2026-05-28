@@ -102,7 +102,7 @@ class DremioClient:
 
     def count_nodes(self) -> int:
         """Count registered executors via sys.nodes (requires executors to run).
-        
+
         This is informational only - if executors aren't running, return 0.
         The KEDA ScaledObjects use executor_desired_small/large for scaling, not this count.
         """

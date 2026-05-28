@@ -137,7 +137,7 @@ class TestDremioMetricsCollector(unittest.TestCase):
     @patch("app.K8sStateCollector")
     def test_collect_jobs(self, mock_k8s, mock_liveness, mock_dremio):
         """Test job collection."""
-        from app import DremioMetricsCollector, MetricsSnapshot
+        from app import DremioMetricsCollector
 
         mock_dremio_instance = MagicMock()
         mock_dremio_instance.list_jobs.return_value = [
