@@ -2,4 +2,5 @@ flask>=3.1,<4
 gunicorn>=23.0,<24
 kubernetes>=31.0,<33
 pytest>=7.0,<9
+pytest-cov>=5.0,<7
 flake8>=7.0,<8
