@@ -165,9 +165,12 @@ class TestDremioMetricsCollector(unittest.TestCase):
 
         mock_dremio_instance = MagicMock()
         mock_dremio_instance.list_jobs.return_value = [
-            {"user": "alice", "state": "RUNNING"},
-            {"user": "bob", "state": "QUEUED"},
-            {"user": "$dremio$", "state": "COMPLETED"},
+            {"user": "alice", "state": "RUNNING", "isComplete": False},
+            {"user": "bob", "state": "QUEUED", "isComplete": False},
+            {"user": "$dremio$", "state": "RUNNING", "isComplete": False},
+            # Terminal jobs must be filtered out
+            {"user": "carol", "state": "COMPLETED", "isComplete": True},
+            {"user": "dave", "state": "FAILED", "isComplete": True},
         ]
         mock_dremio_instance.count_nodes.return_value = 3
 
@@ -194,6 +197,53 @@ class TestDremioMetricsCollector(unittest.TestCase):
         self.assertEqual(result.active_reflection_jobs, 1)
         self.assertEqual(result.registered_executors, 3)
         self.assertEqual(result.executor_desired_small, 1)
+
+    @patch("app.DremioClient")
+    @patch("app.DremioLivenessClient")
+    @patch("app.K8sStateCollector")
+    def test_terminal_jobs_filtered(self, mock_k8s, mock_liveness, mock_dremio):
+        """Terminal jobs (COMPLETED/FAILED/CANCELED) must not count as active."""
+        from app import DremioMetricsCollector
+
+        mock_dremio_instance = MagicMock()
+        mock_dremio_instance.list_jobs.return_value = [
+            {"user": "alice", "state": "COMPLETED", "isComplete": True},
+            {"user": "bob", "state": "FAILED", "isComplete": True},
+            {"user": "carol", "state": "CANCELED", "isComplete": True},
+        ]
+        mock_dremio_instance.count_nodes.return_value = 0
+        mock_liveness.return_value.get_desired.return_value = (0, 0)
+        mock_k8s.return_value.get_replicas.return_value = 0
+        mock_dremio.return_value = mock_dremio_instance
+
+        collector = DremioMetricsCollector()
+        collector._dremio = mock_dremio_instance
+        collector._liveness = mock_liveness.return_value
+        collector._k8s = mock_k8s.return_value
+
+        result = collector._collect()
+
+        self.assertEqual(result.active_user_jobs, 0)
+        self.assertEqual(result.active_reflection_jobs, 0)
+
+    def test_k8s_state_collector_uses_statefulset(self):
+        """K8sStateCollector must call read_namespaced_stateful_set, not deployment."""
+        from app import K8sStateCollector
+        collector = K8sStateCollector()
+        if not collector._client_available:
+            return  # Skip in environments without k8s
+        mock_apps = MagicMock()
+        mock_sts = MagicMock()
+        mock_sts.spec.replicas = 2
+        mock_apps.read_namespaced_stateful_set.return_value = mock_sts
+        collector._apps = mock_apps
+
+        count = collector.get_replicas("dremio-executor-small")
+
+        self.assertEqual(count, 2)
+        mock_apps.read_namespaced_stateful_set.assert_called_once_with(
+            "dremio-executor-small", collector._namespace
+        )
 
 
 if __name__ == "__main__":

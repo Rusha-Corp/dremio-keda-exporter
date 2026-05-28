@@ -5,15 +5,15 @@ KEDA's metrics-api scaler polls to replace the autoscale/autostop CronJobs.
 
 Metrics exposed at GET /json
 ─────────────────────────────────────────────────────────────────────────────
-  active_user_jobs        Running/queued jobs from human users and platform
-                          service accounts (excludes $dremio$, ACCELERATION,
-                          dremio.ops — the ops/system accounts).
-  active_small_jobs      User jobs with planner_estimated_cost <= threshold.
-  active_large_jobs      User jobs with planner_estimated_cost > threshold.
-  active_reflection_jobs  Running jobs from system accounts ($dremio$, etc.).
-  registered_executors    Executors registered with Dremio coordinator.
-  executor_desired_small  Desired Deployment replica count for small tier.
-  executor_desired_large  Desired Deployment replica count for large tier.
+ active_user_jobs     Running/queued jobs from human users and platform
+                      service accounts (excludes $dremio$, ACCELERATION,
+                      dremio.ops — the ops/system accounts).
+ active_small_jobs    User jobs with planner_estimated_cost <= threshold.
+ active_large_jobs    User jobs with planner_estimated_cost > threshold.
+ active_reflection_jobs  Running jobs from system accounts ($dremio$, etc.).
+ registered_executors Executors registered with Dremio coordinator.
+ executor_desired_small  Desired StatefulSet replica count for small tier.
+ executor_desired_large  Desired StatefulSet replica count for large tier.
 
 Scale gate logic (per tier)
 ────────────────────────────
@@ -50,7 +50,8 @@ DREMIO_URL = os.environ.get(
     "DREMIO_URL", "http://dremio-coordinator-hs.dremio.svc.cluster.local:9047"
 )
 DREMIO_LIVENESS_URL = os.environ.get(
-    "DREMIO_LIVENESS_URL", "http://dremio-coordinator-liveness.dremio.svc.cluster.local:45679/metrics"
+    "DREMIO_LIVENESS_URL",
+    "http://dremio-coordinator-liveness.dremio.svc.cluster.local:45679/metrics",
 )
 DREMIO_USERNAME = os.environ.get("DREMIO_USERNAME", "")
 DREMIO_PASSWORD = os.environ.get("DREMIO_PASSWORD", "")
@@ -59,9 +60,10 @@ MAX_EXECUTORS = int(os.environ.get("MAX_EXECUTORS", "4"))
 SCALE_DOWN_GRACE_SECS = int(os.environ.get("SCALE_DOWN_GRACE_SECS", "120"))
 
 _SYSTEM_USERS = ["$dremio$", "ACCELERATION", "dremio.ops"]
-
+_TERMINAL_STATES = {"COMPLETED", "FAILED", "CANCELED", "CANCELLATION_REQUESTED"}
 
 # ── Dremio REST client ─────────────────────────────────────────────────────────
+
 
 class DremioClient:
     """Thin Dremio REST client with session token caching (1h TTL)."""
@@ -86,7 +88,7 @@ class DremioClient:
         self._token_ts = time.time()
 
     def list_jobs(self) -> list[dict]:
-        """List jobs via REST API (no executor needed)."""
+        """List active (non-terminal) jobs via REST API."""
         self._ensure_token()
         headers = {
             "Authorization": f"_dremio{self._token}",
@@ -112,8 +114,6 @@ class DremioClient:
             "Content-Type": "application/json",
         }
         try:
-            # Use a simple SQL query - will fail if no executors available
-            # but we fail-open and return 0 in that case
             sql = "SELECT COUNT(*) AS cnt FROM sys.nodes WHERE is_executor = true"
             req = Request(
                 f"{self._url}/api/v3/sql",
@@ -125,7 +125,6 @@ class DremioClient:
             job_id = data.get("id")
             if not job_id:
                 return 0
-            # Poll with very short timeout for immediate result
             for _ in range(5):
                 time.sleep(0.3)
                 req = Request(f"{self._url}/api/v3/job/{job_id}", headers=headers)
@@ -163,6 +162,7 @@ class DremioLivenessClient:
 
 # ── Metrics collector ──────────────────────────────────────────────────────────
 
+
 @dataclass
 class MetricsSnapshot:
     active_user_jobs: int = 0
@@ -187,8 +187,9 @@ class MetricsSnapshot:
 
 # ── Kubernetes state collector ─────────────────────────────────────────────────
 
+
 class K8sStateCollector:
-    """Fetches current Deployment replica counts."""
+    """Fetches current StatefulSet replica counts."""
 
     def __init__(self):
         try:
@@ -203,18 +204,19 @@ class K8sStateCollector:
             self._namespace = "dremio"
 
     def get_replicas(self, name: str) -> int:
-        """Get current replica count for a Deployment."""
+        """Get current replica count for a StatefulSet."""
         if not self._client_available:
             return 0
         try:
-            deployment = self._apps.read_namespaced_deployment(name, self._namespace)
-            return deployment.spec.replicas or 0
+            sts = self._apps.read_namespaced_stateful_set(name, self._namespace)
+            return sts.spec.replicas or 0
         except Exception as e:
-            logger.warning("Failed to read deployment %s: %s", name, e)
+            logger.warning("Failed to read statefulset %s: %s", name, e)
             return 0
 
 
 # ── Main metrics collector ─────────────────────────────────────────────────────
+
 
 class DremioMetricsCollector:
     """Orchestrates all collectors and computes executor_desired counts."""
@@ -225,8 +227,9 @@ class DremioMetricsCollector:
         self._k8s = K8sStateCollector()
         self._cache: Optional[MetricsSnapshot] = None
         self._cache_ts: float = 0
-        self._last_active_small: float = 0.0
-        self._last_active_large: float = 0.0
+        # Initialize to now so the grace period starts from startup, not epoch
+        self._last_active_small: float = time.time()
+        self._last_active_large: float = time.time()
 
     def get(self) -> MetricsSnapshot:
         """Return last cached snapshot immediately (never blocks)."""
@@ -248,6 +251,9 @@ class DremioMetricsCollector:
             user_jobs = 0
             reflection_jobs = 0
             for job in jobs:
+                # Skip terminal (completed/failed/canceled) jobs
+                if job.get("isComplete", False) or job.get("state", "") in _TERMINAL_STATES:
+                    continue
                 user = job.get("user", "")
                 if user in _SYSTEM_USERS:
                     reflection_jobs += 1
@@ -272,9 +278,13 @@ class DremioMetricsCollector:
             self._last_active_large = now
 
         # ── Get desired counts from Dremio's liveness metrics ────────────
-        desired_small, desired_large = self._liveness.get_desired()
+        try:
+            desired_small, desired_large = self._liveness.get_desired()
+        except Exception as exc:
+            logger.warning("liveness get_desired failed: %s", exc)
+            desired_small, desired_large = 0, 0
 
-        # ── Current Deployment replica counts ────────────────────────────
+        # ── Current StatefulSet replica counts ───────────────────────────
         current_small = self._k8s.get_replicas("dremio-executor-small")
         current_large = self._k8s.get_replicas("dremio-executor-large")
 
@@ -287,17 +297,22 @@ class DremioMetricsCollector:
         )
         return snap
 
-    def _compute_desired_small(self, current: int, small_jobs: int, reflection_jobs: int, dremio_desired: int) -> int:
+    def _compute_desired_small(
+        self, current: int, small_jobs: int, reflection_jobs: int, dremio_desired: int
+    ) -> int:
         now = time.time()
         if small_jobs > 0 or reflection_jobs > 0:
             return max(current, max(dremio_desired, 1))
         secs_idle = now - self._last_active_small
         if current > 0 and secs_idle < SCALE_DOWN_GRACE_SECS:
-            logger.info("small tier idle for %.0fs/%ds, holding at %d", secs_idle, SCALE_DOWN_GRACE_SECS, current)
+            logger.info(
+                "small tier idle for %.0fs/%ds, holding at %d",
+                secs_idle, SCALE_DOWN_GRACE_SECS, current,
+            )
             return current
         if current > 0:
             logger.info("small tier idle for %.0fs (past grace), scaling to 0", secs_idle)
-        return 0
+            return 0
 
     def _compute_desired_large(self, current: int, large_jobs: int, dremio_desired: int) -> int:
         now = time.time()
@@ -305,11 +320,14 @@ class DremioMetricsCollector:
             return max(current, dremio_desired)
         secs_idle = now - self._last_active_large
         if current > 0 and secs_idle < SCALE_DOWN_GRACE_SECS:
-            logger.info("large tier idle for %.0fs/%ds, holding at %d", secs_idle, SCALE_DOWN_GRACE_SECS, current)
+            logger.info(
+                "large tier idle for %.0fs/%ds, holding at %d",
+                secs_idle, SCALE_DOWN_GRACE_SECS, current,
+            )
             return current
         if current > 0:
             logger.info("large tier idle for %.0fs (past grace), scaling to 0", secs_idle)
-        return 0
+            return 0
 
 
 # ── Singleton ──────────────────────────────────────────────────────────────────
@@ -330,6 +348,7 @@ def _bg_collect_loop() -> None:
 
 
 # ── Flask routes ───────────────────────────────────────────────────────────────
+
 
 @app.before_request
 def _ensure_bg_thread() -> None:
