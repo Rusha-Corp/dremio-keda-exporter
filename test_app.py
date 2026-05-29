@@ -205,7 +205,7 @@ class TestSignal3Propagation(unittest.TestCase):
         mock_time.time.return_value = 1000.0
         mock_time.sleep = MagicMock()
 
-        from app import DremioMetricsCollector, SCALE_DOWN_GRACE_SECS
+        from app import SCALE_DOWN_GRACE_SECS
 
         collector = self._make_collector()
 
@@ -234,7 +234,7 @@ class TestSignal3Propagation(unittest.TestCase):
         mock_time.time.return_value = 1000.0
         mock_time.sleep = MagicMock()
 
-        from app import DremioMetricsCollector, SCALE_DOWN_GRACE_SECS
+        from app import SCALE_DOWN_GRACE_SECS
 
         collector = self._make_collector()
 
