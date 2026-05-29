@@ -166,15 +166,17 @@ class K8sStateCollector:
         except Exception as exc:
             logger.warning("K8s client not available: %s", exc)
 
-    def get_statefulset_info(self, name: str) -> tuple[int, int, float]:
-        """Return (spec_replicas, ready_replicas, scale_requested_at_epoch).
+    def get_statefulset_info(self, name: str) -> tuple[int, int, float, int]:
+        """Return (spec_replicas, ready_replicas, scale_requested_at_epoch, scale_requested_count).
 
         scale_requested_at_epoch comes from the dremio.io/scale-requested-at
         annotation written by ElasticResourceAllocator before cold-starting pods.
-        Returns 0.0 if the annotation is absent or unparseable.
+        Returns 0.0 for the timestamp if the annotation is absent or unparseable.
+        scale_requested_count comes from dremio.io/scale-requested-count,
+        the desired replica count the coordinator requested. Returns 0 if absent.
         """
         if not self._available:
-            return 0, 0, 0.0
+            return 0, 0, 0.0, 0
         try:
             sts = self._apps.read_namespaced_stateful_set(name, self._namespace)
             spec_replicas = sts.spec.replicas or 0
@@ -184,10 +186,14 @@ class K8sStateCollector:
                 scale_ts = int(annotations.get("dremio.io/scale-requested-at", "0")) / 1000.0
             except (ValueError, TypeError):
                 scale_ts = 0.0
-            return spec_replicas, ready_replicas, scale_ts
+            try:
+                scale_count = int(annotations.get("dremio.io/scale-requested-count", "0"))
+            except (ValueError, TypeError):
+                scale_count = 0
+            return spec_replicas, ready_replicas, scale_ts, scale_count
         except Exception as exc:
             logger.warning("Failed to read StatefulSet %s: %s", name, exc)
-            return 0, 0, 0.0
+            return 0, 0, 0.0, 0
 
 
 # ── Metrics snapshot ───────────────────────────────────────────────────────────
@@ -253,8 +259,8 @@ class DremioMetricsCollector:
         grace_ms = SCALE_DOWN_GRACE_SECS * 1000
 
         # ── K8s StatefulSet state ─────────────────────────────────────────
-        spec_small, ready_small, scale_req_small = self._k8s.get_statefulset_info("dremio-executor-small")
-        spec_large, ready_large, scale_req_large = self._k8s.get_statefulset_info("dremio-executor-large")
+        spec_small, ready_small, scale_req_small, scale_req_small_count = self._k8s.get_statefulset_info("dremio-executor-small")
+        spec_large, ready_large, scale_req_large, scale_req_large_count = self._k8s.get_statefulset_info("dremio-executor-large")
 
         # ── Ready-replica window tracking ─────────────────────────────────
         # From the moment readyReplicas first becomes > 0, we start a grace window.
@@ -334,14 +340,16 @@ class DremioMetricsCollector:
             self._last_active_large = now
 
         # Signal 3: scale-request annotation written by ElasticResourceAllocator.
-        # Also bump spec floor to 1 so _compute_desired returns ≥ 1 even if KEDA
-        # already deactivated spec.replicas to 0 before the exporter could respond.
+        # The scale-requested-count annotation carries the desired replica count.
+        # We propagate it to KEDA via desired=N so KEDA applies spec.replicas=N
+        # instead of overriding it. This makes KEDA the sole authority on spec.replicas
+        # and eliminates the dual-write race condition.
         if scale_req_small and (now - scale_req_small) < SCALE_DOWN_GRACE_SECS:
             self._last_active_small = now
-            spec_small = max(spec_small, 1)
+            spec_small = max(spec_small, scale_req_small_count)
         if scale_req_large and (now - scale_req_large) < SCALE_DOWN_GRACE_SECS:
             self._last_active_large = now
-            spec_large = max(spec_large, 1)
+            spec_large = max(spec_large, scale_req_large_count)
 
         # ── Compute desired replica counts ────────────────────────────────
         snap.executor_desired_small = self._compute_desired("small", spec_small, self._last_active_small)
@@ -351,9 +359,10 @@ class DremioMetricsCollector:
     def _compute_desired(self, tier: str, spec_replicas: int, last_active: float) -> int:
         """Hold at spec_replicas while within grace; return 0 when idle past grace.
 
-        Never forces replicas higher than what's already spec'd — that is
-        ElasticResourceAllocator's job via the annotation + direct scale call.
-        Holding spec_replicas prevents KEDA from racing the allocator to 0.
+        spec_replicas may already carry the requested count from the
+        scale-requested-count annotation (applied in Signal 3). KEDA is the
+        sole authority on spec.replicas — this method never writes to K8s.
+        Holding spec_replicas prevents KEDA from scaling to 0 while jobs run.
         """
         secs_idle = time.time() - last_active
         if last_active > 0 and secs_idle < SCALE_DOWN_GRACE_SECS:
