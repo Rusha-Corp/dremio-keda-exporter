@@ -205,8 +205,6 @@ class TestSignal3Propagation(unittest.TestCase):
         mock_time.time.return_value = 1000.0
         mock_time.sleep = MagicMock()
 
-        from app import SCALE_DOWN_GRACE_SECS
-
         collector = self._make_collector()
 
         # No recent jobs
