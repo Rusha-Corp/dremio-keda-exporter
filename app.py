@@ -58,6 +58,7 @@ DREMIO_PASSWORD = os.environ.get("DREMIO_PASSWORD", "")
 MIN_EXECUTORS = int(os.environ.get("MIN_EXECUTORS", "0"))
 MAX_EXECUTORS = int(os.environ.get("MAX_EXECUTORS", "4"))
 SCALE_DOWN_GRACE_SECS = int(os.environ.get("SCALE_DOWN_GRACE_SECS", "120"))
+TERMINAL_DRAIN_SECS = int(os.environ.get("TERMINAL_DRAIN_SECS", "120"))
 
 _SYSTEM_USERS = ["$dremio$", "ACCELERATION", "dremio.ops"]
 _TERMINAL_STATES = {"COMPLETED", "FAILED", "CANCELED", "CANCELLATION_REQUESTED"}
@@ -88,16 +89,22 @@ class DremioClient:
         self._token_ts = time.time()
 
     def list_jobs(self) -> list[dict]:
-        """List active (non-terminal) jobs via REST API."""
+        """List all jobs via REST API, following pagination."""
         self._ensure_token()
         headers = {
             "Authorization": f"_dremio{self._token}",
             "Content-Type": "application/json",
         }
         try:
-            resp = urlopen(Request(f"{self._url}/apiv2/jobs", headers=headers), timeout=30)
-            data = json.loads(resp.read())
-            return data.get("jobs", [])
+            url: Optional[str] = f"{self._url}/apiv2/jobs"
+            all_jobs: list[dict] = []
+            while url:
+                resp = urlopen(Request(url, headers=headers), timeout=30)
+                data = json.loads(resp.read())
+                all_jobs.extend(data.get("jobs", []))
+                next_path = data.get("next")
+                url = f"{self._url}{next_path}" if next_path else None
+            return all_jobs
         except HTTPError as exc:
             logger.warning("apiv2/jobs HTTP %s", exc.code)
             raise
@@ -230,6 +237,9 @@ class DremioMetricsCollector:
         # Initialize to now so the grace period starts from startup, not epoch
         self._last_active_small: float = time.time()
         self._last_active_large: float = time.time()
+        # Track when terminal drain period started (0 = not in drain)
+        self._drain_started_small: float = 0.0
+        self._drain_started_large: float = 0.0
 
     def get(self) -> MetricsSnapshot:
         """Return last cached snapshot immediately (never blocks)."""
@@ -302,6 +312,7 @@ class DremioMetricsCollector:
     ) -> int:
         now = time.time()
         if small_jobs > 0 or reflection_jobs > 0:
+            self._drain_started_small = 0.0
             return max(current, max(dremio_desired, 1))
         secs_idle = now - self._last_active_small
         if current > 0 and secs_idle < SCALE_DOWN_GRACE_SECS:
@@ -311,7 +322,21 @@ class DremioMetricsCollector:
             )
             return current
         if current > 0:
-            logger.info("small tier idle for %.0fs (past grace), scaling to 0", secs_idle)
+            if self._drain_started_small == 0.0:
+                self._drain_started_small = now
+                logger.info(
+                    "small tier idle for %.0fs (past grace), entering drain period (%ds)",
+                    secs_idle, TERMINAL_DRAIN_SECS,
+                )
+            drain_elapsed = now - self._drain_started_small
+            if drain_elapsed < TERMINAL_DRAIN_SECS:
+                logger.info(
+                    "small tier in drain period (%.0fs/%ds), holding at %d",
+                    drain_elapsed, TERMINAL_DRAIN_SECS, current,
+                )
+                return current
+            logger.info("small tier drain complete (%.0fs), scaling to 0", drain_elapsed)
+            self._drain_started_small = 0.0
         return 0
 
     def _compute_desired_large(self, current: int, large_jobs: int, dremio_desired: int) -> int:
@@ -323,6 +348,7 @@ class DremioMetricsCollector:
         """
         now = time.time()
         if large_jobs > 0:
+            self._drain_started_large = 0.0
             # dremio_desired is always 0 (metric not emitted by Dremio) — use 1 as floor
             return max(current, max(dremio_desired, 1))
         secs_idle = now - self._last_active_large
@@ -333,7 +359,21 @@ class DremioMetricsCollector:
             )
             return current
         if current > 0:
-            logger.info("large tier idle for %.0fs (past grace), scaling to 0", secs_idle)
+            if self._drain_started_large == 0.0:
+                self._drain_started_large = now
+                logger.info(
+                    "large tier idle for %.0fs (past grace), entering drain period (%ds)",
+                    secs_idle, TERMINAL_DRAIN_SECS,
+                )
+            drain_elapsed = now - self._drain_started_large
+            if drain_elapsed < TERMINAL_DRAIN_SECS:
+                logger.info(
+                    "large tier in drain period (%.0fs/%ds), holding at %d",
+                    drain_elapsed, TERMINAL_DRAIN_SECS, current,
+                )
+                return current
+            logger.info("large tier drain complete (%.0fs), scaling to 0", drain_elapsed)
+            self._drain_started_large = 0.0
         return 0
 
 
@@ -351,7 +391,7 @@ def _bg_collect_loop() -> None:
             _collector.refresh()
         except Exception as exc:
             logger.warning("Background collect error: %s", exc)
-        time.sleep(15)
+        time.sleep(5)
 
 
 # ── Flask routes ───────────────────────────────────────────────────────────────

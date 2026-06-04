@@ -1,6 +1,7 @@
 """Tests for the Dremio metrics exporter."""
 
 import json
+import time
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -76,18 +77,25 @@ class TestDremioClient(unittest.TestCase):
         self.assertEqual(jobs, [])
 
     @patch("app.urlopen")
-    def test_list_jobs_with_next(self, mock_urlopen):
-        """Test job list with pagination."""
+    def test_list_jobs_follows_pagination(self, mock_urlopen):
+        """Test that list_jobs follows all pagination pages."""
         login_resp = _login_response()
-        jobs_resp = MagicMock()
-        jobs_resp.read.return_value = json.dumps({
+        page1_resp = MagicMock()
+        page1_resp.read.return_value = json.dumps({
             "jobs": [{"id": "1", "user": "alice"}],
-            "next": "/jobs/?offset=100",
+            "next": "/apiv2/jobs?offset=1",
         }).encode()
-        mock_urlopen.side_effect = [login_resp, jobs_resp]
+        page2_resp = MagicMock()
+        page2_resp.read.return_value = json.dumps({
+            "jobs": [{"id": "2", "user": "bob"}, {"id": "3", "user": "carol"}],
+            "next": None,
+        }).encode()
+        mock_urlopen.side_effect = [login_resp, page1_resp, page2_resp]
 
         jobs = self.client.list_jobs()
-        self.assertEqual(len(jobs), 1)
+        self.assertEqual(len(jobs), 3)
+        self.assertEqual(jobs[0]["user"], "alice")
+        self.assertEqual(jobs[2]["user"], "carol")
 
     @patch("app.urlopen")
     def test_count_nodes_success(self, mock_urlopen):
@@ -244,6 +252,77 @@ class TestDremioMetricsCollector(unittest.TestCase):
         mock_apps.read_namespaced_stateful_set.assert_called_once_with(
             "dremio-executor-small", collector._namespace
         )
+
+
+class TestDrainGuard(unittest.TestCase):
+    """Tests for terminal drain guard logic."""
+
+    def _make_collector(self):
+        from app import DremioMetricsCollector
+        with patch("app.DremioClient"), patch("app.DremioLivenessClient"), patch("app.K8sStateCollector"):
+            c = DremioMetricsCollector()
+        return c
+
+    def test_drain_guard_holds_before_drain_complete(self):
+        """After grace period, desired stays at current for TERMINAL_DRAIN_SECS before going to 0."""
+        import app
+        c = self._make_collector()
+        c._last_active_small = 0.0  # long ago (infinite idle)
+
+        result = c._compute_desired_small(current=2, small_jobs=0, reflection_jobs=0, dremio_desired=0)
+        # First call: drain period starts, hold at 2
+        self.assertEqual(result, 2)
+        self.assertGreater(c._drain_started_small, 0.0)
+
+    def test_drain_guard_returns_zero_after_drain_complete(self):
+        """After TERMINAL_DRAIN_SECS, desired goes to 0."""
+        import app
+        c = self._make_collector()
+        c._last_active_small = 0.0
+        c._drain_started_small = time.time() - app.TERMINAL_DRAIN_SECS - 1  # drain elapsed
+
+        result = c._compute_desired_small(current=2, small_jobs=0, reflection_jobs=0, dremio_desired=0)
+        self.assertEqual(result, 0)
+        self.assertEqual(c._drain_started_small, 0.0)  # reset
+
+    def test_drain_guard_resets_when_jobs_become_active(self):
+        """If jobs appear during drain period, drain timer resets."""
+        import app
+        c = self._make_collector()
+        c._last_active_small = 0.0
+        c._drain_started_small = time.time() - 60  # drain in progress
+
+        result = c._compute_desired_small(current=2, small_jobs=1, reflection_jobs=0, dremio_desired=0)
+        self.assertGreaterEqual(result, 1)
+        self.assertEqual(c._drain_started_small, 0.0)  # reset
+
+    def test_large_drain_guard_holds_before_drain_complete(self):
+        """Large tier drain guard mirrors small tier behavior."""
+        c = self._make_collector()
+        c._last_active_large = 0.0
+
+        result = c._compute_desired_large(current=3, large_jobs=0, dremio_desired=0)
+        self.assertEqual(result, 3)
+        self.assertGreater(c._drain_started_large, 0.0)
+
+    def test_large_drain_guard_resets_on_active_jobs(self):
+        """Large tier drain timer resets when large jobs appear."""
+        c = self._make_collector()
+        c._last_active_large = 0.0
+        c._drain_started_large = time.time() - 60
+
+        result = c._compute_desired_large(current=3, large_jobs=2, dremio_desired=0)
+        self.assertGreaterEqual(result, 1)
+        self.assertEqual(c._drain_started_large, 0.0)
+
+    def test_within_grace_period_no_drain(self):
+        """Within SCALE_DOWN_GRACE_SECS, drain guard does not activate."""
+        c = self._make_collector()
+        c._last_active_small = time.time() - 10  # 10s ago, within grace
+
+        result = c._compute_desired_small(current=1, small_jobs=0, reflection_jobs=0, dremio_desired=0)
+        self.assertEqual(result, 1)
+        self.assertEqual(c._drain_started_small, 0.0)  # drain not started
 
 
 if __name__ == "__main__":
