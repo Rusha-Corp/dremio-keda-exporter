@@ -146,45 +146,6 @@ class DremioClient:
         logger.debug("list_jobs: %d active jobs across %d page(s)", len(active_jobs), page)
         return active_jobs
 
-    def count_nodes(self) -> int:
-        """Count registered executors via sys.nodes (requires executors to run).
-
-        This is informational only - if executors aren't running, return 0.
-        The KEDA ScaledObjects use executor_desired_small/large for scaling, not this count.
-        """
-        self._ensure_token()
-        headers = {
-            "Authorization": f"_dremio{self._token}",
-            "Content-Type": "application/json",
-        }
-        try:
-            sql = "SELECT COUNT(*) AS cnt FROM sys.nodes WHERE is_executor = true"
-            req = Request(
-                f"{self._url}/api/v3/sql",
-                data=json.dumps({"sql": sql}).encode(),
-                headers=headers,
-            )
-            resp = urlopen(req, timeout=5)
-            data = json.loads(resp.read())
-            job_id = data.get("id")
-            if not job_id:
-                return 0
-            for _ in range(5):
-                time.sleep(0.3)
-                req = Request(f"{self._url}/api/v3/job/{job_id}", headers=headers)
-                job_state = json.loads(urlopen(req, timeout=5).read()).get("jobState", "")
-                if job_state == "COMPLETED":
-                    req = Request(f"{self._url}/api/v3/job/{job_id}/results", headers=headers)
-                    result = json.loads(urlopen(req, timeout=5).read())
-                    rows = result.get("rows", [])
-                    return int(rows[0]["cnt"]) if rows else 0
-                if job_state == "FAILED":
-                    return 0
-            return 0
-        except Exception as exc:
-            logger.warning("count_nodes failed: %s", exc)
-            return 0
-
 
 class DremioLivenessClient:
     """Scrapes Dremio liveness /metrics endpoint for gauge values."""
@@ -295,12 +256,10 @@ class DremioMetricsCollector:
         # ── Dremio job metrics via REST (no executor needed) ───────────────
         try:
             jobs = self._dremio.list_jobs()
+            # list_jobs() already returns only non-terminal jobs within the lookback window
             user_jobs = 0
             reflection_jobs = 0
             for job in jobs:
-                # Skip terminal (completed/failed/canceled) jobs
-                if job.get("isComplete", False) or job.get("state", "") in _TERMINAL_STATES:
-                    continue
                 user = job.get("user", "")
                 if user in _SYSTEM_USERS:
                     reflection_jobs += 1
@@ -310,7 +269,6 @@ class DremioMetricsCollector:
             snap.active_small_jobs = user_jobs
             snap.active_large_jobs = user_jobs
             snap.active_reflection_jobs = reflection_jobs
-            snap.registered_executors = self._dremio.count_nodes()
         except Exception as exc:
             # Fail open: any error (timeout, connection refused, OOM, etc.) must
             # NOT cause KEDA to see zero active jobs and scale down. Return 99 so
@@ -335,8 +293,12 @@ class DremioMetricsCollector:
             desired_small, desired_large = 0, 0
 
         # ── Current StatefulSet replica counts ───────────────────────────
+        # These are read from the K8s API (no Dremio SQL job created).
+        # registered_executors uses the same values as a lightweight alternative
+        # to the old count_nodes() SQL query which generated ~17k jobs/day.
         current_small = self._k8s.get_replicas("dremio-executor-small")
         current_large = self._k8s.get_replicas("dremio-executor-large")
+        snap.registered_executors = current_small + current_large
 
         # ── Compute desired counts ───────────────────────────────────────
         snap.executor_desired_small = self._compute_desired_small(

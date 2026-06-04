@@ -161,46 +161,6 @@ class TestDremioClient(unittest.TestCase):
         # login call + MAX_JOB_PAGES page calls
         self.assertEqual(mock_urlopen.call_count, 1 + app.MAX_JOB_PAGES)
 
-    @patch("app.urlopen")
-    def test_count_nodes_success(self, mock_urlopen):
-        """Test successful node count."""
-        login_resp = _login_response()
-        submit_resp = MagicMock()
-        submit_resp.read.return_value = json.dumps(
-            {"id": "test-job-id"}
-        ).encode()
-        status_resp = MagicMock()
-        status_resp.read.return_value = json.dumps(
-            {"jobState": "COMPLETED"}
-        ).encode()
-        results_resp = MagicMock()
-        results_resp.read.return_value = json.dumps(
-            {"rows": [{"cnt": 3}]}
-        ).encode()
-        mock_urlopen.side_effect = [
-            login_resp, submit_resp, status_resp, results_resp
-        ]
-
-        count = self.client.count_nodes()
-        self.assertEqual(count, 3)
-
-    @patch("app.urlopen")
-    def test_count_nodes_failed(self, mock_urlopen):
-        """Test node count when query fails."""
-        login_resp = _login_response()
-        submit_resp = MagicMock()
-        submit_resp.read.return_value = json.dumps(
-            {"id": "test-job-id"}
-        ).encode()
-        status_resp = MagicMock()
-        status_resp.read.return_value = json.dumps(
-            {"jobState": "FAILED"}
-        ).encode()
-        mock_urlopen.side_effect = [login_resp, submit_resp, status_resp]
-
-        count = self.client.count_nodes()
-        self.assertEqual(count, 0)
-
 
 class TestMetricsSnapshot(unittest.TestCase):
     """Tests for MetricsSnapshot dataclass."""
@@ -236,15 +196,12 @@ class TestDremioMetricsCollector(unittest.TestCase):
         from app import DremioMetricsCollector
 
         mock_dremio_instance = MagicMock()
+        # list_jobs() already returns only non-terminal jobs (terminal filtering done inside it)
         mock_dremio_instance.list_jobs.return_value = [
             {"user": "alice", "state": "RUNNING", "isComplete": False},
             {"user": "bob", "state": "QUEUED", "isComplete": False},
             {"user": "$dremio$", "state": "RUNNING", "isComplete": False},
-            # Terminal jobs must be filtered out
-            {"user": "carol", "state": "COMPLETED", "isComplete": True},
-            {"user": "dave", "state": "FAILED", "isComplete": True},
         ]
-        mock_dremio_instance.count_nodes.return_value = 3
 
         mock_liveness_instance = MagicMock()
         mock_liveness_instance.get_desired.return_value = (1, 2)
@@ -267,7 +224,8 @@ class TestDremioMetricsCollector(unittest.TestCase):
 
         self.assertEqual(result.active_user_jobs, 2)
         self.assertEqual(result.active_reflection_jobs, 1)
-        self.assertEqual(result.registered_executors, 3)
+        # registered_executors = sum of K8s StatefulSet replicas (small=1 + large=1)
+        self.assertEqual(result.registered_executors, 2)
         self.assertEqual(result.executor_desired_small, 1)
 
     @patch("app.DremioClient")
@@ -278,12 +236,8 @@ class TestDremioMetricsCollector(unittest.TestCase):
         from app import DremioMetricsCollector
 
         mock_dremio_instance = MagicMock()
-        mock_dremio_instance.list_jobs.return_value = [
-            {"user": "alice", "state": "COMPLETED", "isComplete": True},
-            {"user": "bob", "state": "FAILED", "isComplete": True},
-            {"user": "carol", "state": "CANCELED", "isComplete": True},
-        ]
-        mock_dremio_instance.count_nodes.return_value = 0
+        # list_jobs() filters terminal jobs internally; it returns an empty list here
+        mock_dremio_instance.list_jobs.return_value = []
         mock_liveness.return_value.get_desired.return_value = (0, 0)
         mock_k8s.return_value.get_replicas.return_value = 0
         mock_dremio.return_value = mock_dremio_instance
