@@ -265,7 +265,6 @@ class TestDrainGuard(unittest.TestCase):
 
     def test_drain_guard_holds_before_drain_complete(self):
         """After grace period, desired stays at current for TERMINAL_DRAIN_SECS before going to 0."""
-        import app
         c = self._make_collector()
         c._last_active_small = 0.0  # long ago (infinite idle)
 
@@ -287,7 +286,6 @@ class TestDrainGuard(unittest.TestCase):
 
     def test_drain_guard_resets_when_jobs_become_active(self):
         """If jobs appear during drain period, drain timer resets."""
-        import app
         c = self._make_collector()
         c._last_active_small = 0.0
         c._drain_started_small = time.time() - 60  # drain in progress
