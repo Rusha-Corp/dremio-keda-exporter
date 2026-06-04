@@ -78,12 +78,16 @@ class TestDremioClient(unittest.TestCase):
 
     @patch("app.urlopen")
     def test_list_jobs_follows_pagination(self, mock_urlopen):
-        """Test that list_jobs follows all pagination pages."""
+        """Test that list_jobs follows all pagination pages.
+
+        Dremio's 'next' field uses /jobs/? path but the API is at /apiv2/jobs,
+        so the exporter must extract only the query string.
+        """
         login_resp = _login_response()
         page1_resp = MagicMock()
         page1_resp.read.return_value = json.dumps({
             "jobs": [{"id": "1", "user": "alice"}],
-            "next": "/apiv2/jobs?offset=1",
+            "next": "/jobs/?offset=100&limit=100",
         }).encode()
         page2_resp = MagicMock()
         page2_resp.read.return_value = json.dumps({
@@ -96,6 +100,10 @@ class TestDremioClient(unittest.TestCase):
         self.assertEqual(len(jobs), 3)
         self.assertEqual(jobs[0]["user"], "alice")
         self.assertEqual(jobs[2]["user"], "carol")
+        # Verify the second call used the correct /apiv2/jobs URL, not /jobs/
+        second_call_url = mock_urlopen.call_args_list[2][0][0].full_url
+        self.assertIn("/apiv2/jobs", second_call_url)
+        self.assertIn("offset=100", second_call_url)
 
     @patch("app.urlopen")
     def test_count_nodes_success(self, mock_urlopen):

@@ -103,7 +103,12 @@ class DremioClient:
                 data = json.loads(resp.read())
                 all_jobs.extend(data.get("jobs", []))
                 next_path = data.get("next")
-                url = f"{self._url}{next_path}" if next_path else None
+                # Dremio's "next" uses /jobs/? but the API endpoint is /apiv2/jobs
+                # Extract only the query string to build the correct next page URL
+                if next_path and "?" in next_path:
+                    url = f"{self._url}/apiv2/jobs?{next_path.split('?', 1)[1]}"
+                else:
+                    url = None
             return all_jobs
         except HTTPError as exc:
             logger.warning("apiv2/jobs HTTP %s", exc.code)
