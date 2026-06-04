@@ -45,23 +45,24 @@ class TestDremioClient(unittest.TestCase):
         mock_urlopen.assert_not_called()
 
     @patch("app.urlopen")
-    def test_list_jobs_success(self, mock_urlopen):
-        """Test successful job listing."""
+    def test_list_jobs_returns_only_active(self, mock_urlopen):
+        """list_jobs() must return only non-terminal jobs; terminal jobs are dropped."""
         login_resp = _login_response()
         jobs_resp = MagicMock()
         jobs_resp.read.return_value = json.dumps({
             "jobs": [
-                {"id": "1", "user": "alice", "state": "RUNNING"},
-                {"id": "2", "user": "$dremio$", "state": "COMPLETED"},
+                {"id": "1", "user": "alice", "state": "RUNNING", "isComplete": False},
+                {"id": "2", "user": "$dremio$", "state": "COMPLETED", "isComplete": True},
+                {"id": "3", "user": "bob", "state": "FAILED", "isComplete": True},
             ],
             "next": None,
         }).encode()
         mock_urlopen.side_effect = [login_resp, jobs_resp]
 
         jobs = self.client.list_jobs()
-        self.assertEqual(len(jobs), 2)
+        # Only the RUNNING job should be returned; COMPLETED and FAILED are dropped
+        self.assertEqual(len(jobs), 1)
         self.assertEqual(jobs[0]["user"], "alice")
-        self.assertEqual(jobs[1]["user"], "$dremio$")
 
     @patch("app.urlopen")
     def test_list_jobs_empty(self, mock_urlopen):
@@ -78,20 +79,23 @@ class TestDremioClient(unittest.TestCase):
 
     @patch("app.urlopen")
     def test_list_jobs_follows_pagination(self, mock_urlopen):
-        """Test that list_jobs follows all pagination pages.
-
-        Dremio's 'next' field uses /jobs/? path but the API is at /apiv2/jobs,
-        so the exporter must extract only the query string.
-        """
+        """list_jobs follows pagination pages and fixes Dremio's wrong /jobs/? next URL."""
+        now_ms = int(time.time() * 1000)
         login_resp = _login_response()
         page1_resp = MagicMock()
         page1_resp.read.return_value = json.dumps({
-            "jobs": [{"id": "1", "user": "alice"}],
+            "jobs": [{"id": "1", "user": "alice", "state": "RUNNING",
+                      "isComplete": False, "startTime": now_ms}],
             "next": "/jobs/?offset=100&limit=100",
         }).encode()
         page2_resp = MagicMock()
         page2_resp.read.return_value = json.dumps({
-            "jobs": [{"id": "2", "user": "bob"}, {"id": "3", "user": "carol"}],
+            "jobs": [
+                {"id": "2", "user": "bob", "state": "RUNNING",
+                 "isComplete": False, "startTime": now_ms - 60_000},
+                {"id": "3", "user": "carol", "state": "RUNNING",
+                 "isComplete": False, "startTime": now_ms - 120_000},
+            ],
             "next": None,
         }).encode()
         mock_urlopen.side_effect = [login_resp, page1_resp, page2_resp]
@@ -100,10 +104,62 @@ class TestDremioClient(unittest.TestCase):
         self.assertEqual(len(jobs), 3)
         self.assertEqual(jobs[0]["user"], "alice")
         self.assertEqual(jobs[2]["user"], "carol")
-        # Verify the second call used the correct /apiv2/jobs URL, not /jobs/
+        # Second jobs call must use /apiv2/jobs, not /jobs/
         second_call_url = mock_urlopen.call_args_list[2][0][0].full_url
         self.assertIn("/apiv2/jobs", second_call_url)
         self.assertIn("offset=100", second_call_url)
+
+    @patch("app.urlopen")
+    def test_list_jobs_stops_at_old_job(self, mock_urlopen):
+        """list_jobs stops pagination when it encounters a job older than JOB_LOOKBACK_SECS."""
+        import app
+        now_ms = int(time.time() * 1000)
+        old_ms = int((time.time() - app.JOB_LOOKBACK_SECS - 3600) * 1000)  # definitely old
+        login_resp = _login_response()
+        page1_resp = MagicMock()
+        page1_resp.read.return_value = json.dumps({
+            "jobs": [
+                {"id": "1", "user": "alice", "state": "RUNNING",
+                 "isComplete": False, "startTime": now_ms},
+                {"id": "2", "user": "bob", "state": "RUNNING",
+                 "isComplete": False, "startTime": old_ms},  # triggers stop
+            ],
+            "next": "/jobs/?offset=100&limit=100",
+        }).encode()
+        mock_urlopen.side_effect = [login_resp, page1_resp]
+
+        jobs = self.client.list_jobs()
+        # Only alice (before the old-job cutoff) should be returned; no page 2 fetched
+        self.assertEqual(len(jobs), 1)
+        self.assertEqual(jobs[0]["user"], "alice")
+        self.assertEqual(mock_urlopen.call_count, 2)  # login + page 1 only
+
+    @patch("app.urlopen")
+    def test_list_jobs_stops_at_page_cap(self, mock_urlopen):
+        """list_jobs stops after MAX_JOB_PAGES even if there are more pages."""
+        import app
+        now_ms = int(time.time() * 1000)
+
+        def _make_page(job_id, has_next):
+            m = MagicMock()
+            m.read.return_value = json.dumps({
+                "jobs": [{"id": str(job_id), "user": "u", "state": "RUNNING",
+                          "isComplete": False, "startTime": now_ms}],
+                "next": "/jobs/?offset=100&limit=100" if has_next else None,
+            }).encode()
+            return m
+
+        # Login + MAX_JOB_PAGES pages all with next links
+        responses = [_login_response()]
+        for i in range(app.MAX_JOB_PAGES + 5):
+            responses.append(_make_page(i, has_next=True))
+        mock_urlopen.side_effect = responses
+
+        jobs = self.client.list_jobs()
+        # Should fetch exactly MAX_JOB_PAGES pages (each with 1 job)
+        self.assertEqual(len(jobs), app.MAX_JOB_PAGES)
+        # login call + MAX_JOB_PAGES page calls
+        self.assertEqual(mock_urlopen.call_count, 1 + app.MAX_JOB_PAGES)
 
     @patch("app.urlopen")
     def test_count_nodes_success(self, mock_urlopen):
@@ -241,6 +297,38 @@ class TestDremioMetricsCollector(unittest.TestCase):
 
         self.assertEqual(result.active_user_jobs, 0)
         self.assertEqual(result.active_reflection_jobs, 0)
+
+    @patch("app.DremioClient")
+    @patch("app.DremioLivenessClient")
+    @patch("app.K8sStateCollector")
+    def test_collect_fails_open_on_exception(self, mock_k8s, mock_liveness, mock_dremio):
+        """Any exception from list_jobs must fail open (active=99), not fail closed (active=0).
+
+        Failing closed would cause the scale-gate to think there are no active jobs
+        and allow KEDA to scale executors to zero, killing in-flight queries.
+        """
+        from app import DremioMetricsCollector
+
+        mock_dremio_instance = MagicMock()
+        mock_dremio_instance.list_jobs.side_effect = ConnectionError("connection refused")
+        mock_liveness.return_value.get_desired.return_value = (1, 1)
+        mock_k8s.return_value.get_replicas.return_value = 2
+        mock_dremio.return_value = mock_dremio_instance
+
+        collector = DremioMetricsCollector()
+        collector._dremio = mock_dremio_instance
+        collector._liveness = mock_liveness.return_value
+        collector._k8s = mock_k8s.return_value
+
+        result = collector._collect()
+
+        # Must fail open — NEVER return 0 on error
+        self.assertEqual(result.active_user_jobs, 99)
+        self.assertEqual(result.active_small_jobs, 99)
+        self.assertEqual(result.active_large_jobs, 99)
+        # Scale-gate must hold executors at current count, not zero
+        self.assertGreater(result.executor_desired_small, 0)
+        self.assertGreater(result.executor_desired_large, 0)
 
     def test_k8s_state_collector_uses_statefulset(self):
         """K8sStateCollector must call read_namespaced_stateful_set, not deployment."""

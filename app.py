@@ -59,6 +59,10 @@ MIN_EXECUTORS = int(os.environ.get("MIN_EXECUTORS", "0"))
 MAX_EXECUTORS = int(os.environ.get("MAX_EXECUTORS", "4"))
 SCALE_DOWN_GRACE_SECS = int(os.environ.get("SCALE_DOWN_GRACE_SECS", "120"))
 TERMINAL_DRAIN_SECS = int(os.environ.get("TERMINAL_DRAIN_SECS", "120"))
+# Early-exit pagination: stop after this many pages (hard OOM guard)
+MAX_JOB_PAGES = int(os.environ.get("MAX_JOB_PAGES", "10"))
+# Early-exit pagination: ignore jobs older than this many seconds (active jobs must be recent)
+JOB_LOOKBACK_SECS = int(os.environ.get("JOB_LOOKBACK_SECS", "7200"))
 
 _SYSTEM_USERS = ["$dremio$", "ACCELERATION", "dremio.ops"]
 _TERMINAL_STATES = {"COMPLETED", "FAILED", "CANCELED", "CANCELLATION_REQUESTED"}
@@ -89,30 +93,58 @@ class DremioClient:
         self._token_ts = time.time()
 
     def list_jobs(self) -> list[dict]:
-        """List all jobs via REST API, following pagination."""
+        """Return only active (non-terminal) jobs started within JOB_LOOKBACK_SECS.
+
+        Dremio returns jobs newest-first. We stop pagination as soon as we
+        encounter a job whose startTime is older than the lookback window — any
+        currently-running job must have started within that window. A hard cap
+        of MAX_JOB_PAGES prevents OOMKills when the historical job set is huge
+        (e.g. 8,300+ pages).
+
+        Only non-terminal jobs are returned, so callers never need to re-filter.
+        """
         self._ensure_token()
         headers = {
             "Authorization": f"_dremio{self._token}",
             "Content-Type": "application/json",
         }
+        # Dremio timestamps are Unix milliseconds
+        cutoff_ms = (time.time() - JOB_LOOKBACK_SECS) * 1000
+        url: Optional[str] = f"{self._url}/apiv2/jobs"
+        active_jobs: list[dict] = []
+        page = 0
         try:
-            url: Optional[str] = f"{self._url}/apiv2/jobs"
-            all_jobs: list[dict] = []
-            while url:
+            while url and page < MAX_JOB_PAGES:
                 resp = urlopen(Request(url, headers=headers), timeout=30)
                 data = json.loads(resp.read())
-                all_jobs.extend(data.get("jobs", []))
+                stop_early = False
+                for job in data.get("jobs", []):
+                    start_time = job.get("startTime") or 0
+                    if 0 < start_time < cutoff_ms:
+                        stop_early = True  # everything after this is even older
+                        break
+                    if not job.get("isComplete") and job.get("state", "") not in _TERMINAL_STATES:
+                        active_jobs.append(job)
+                if stop_early:
+                    logger.debug(
+                        "list_jobs: stopping at page %d — job age exceeds %ds lookback",
+                        page, JOB_LOOKBACK_SECS,
+                    )
+                    break
                 next_path = data.get("next")
-                # Dremio's "next" uses /jobs/? but the API endpoint is /apiv2/jobs
-                # Extract only the query string to build the correct next page URL
-                if next_path and "?" in next_path:
-                    url = f"{self._url}/apiv2/jobs?{next_path.split('?', 1)[1]}"
-                else:
-                    url = None
-            return all_jobs
+                # Dremio's "next" uses /jobs/? but the API endpoint is /apiv2/jobs;
+                # extract only the query string to build the correct next-page URL.
+                url = (
+                    f"{self._url}/apiv2/jobs?{next_path.split('?', 1)[1]}"
+                    if next_path and "?" in next_path
+                    else None
+                )
+                page += 1
         except HTTPError as exc:
             logger.warning("apiv2/jobs HTTP %s", exc.code)
             raise
+        logger.debug("list_jobs: %d active jobs across %d page(s)", len(active_jobs), page)
+        return active_jobs
 
     def count_nodes(self) -> int:
         """Count registered executors via sys.nodes (requires executors to run).
@@ -279,11 +311,14 @@ class DremioMetricsCollector:
             snap.active_large_jobs = user_jobs
             snap.active_reflection_jobs = reflection_jobs
             snap.registered_executors = self._dremio.count_nodes()
-        except TimeoutError:
-            logger.warning("Dremio REST timed out (executor saturated) — fail-open")
-            snap.active_user_jobs = 99
         except Exception as exc:
-            logger.warning("Dremio unavailable: %s", exc)
+            # Fail open: any error (timeout, connection refused, OOM, etc.) must
+            # NOT cause KEDA to see zero active jobs and scale down. Return 99 so
+            # the scale-gate holds all tiers at their current replica counts.
+            logger.warning("Dremio unavailable: %s — failing open", exc)
+            snap.active_user_jobs = 99
+            snap.active_small_jobs = 99
+            snap.active_large_jobs = 99
 
         # ── Update last-active timestamps ────────────────────────────────
         now = time.time()
