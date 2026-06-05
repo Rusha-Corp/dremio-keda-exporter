@@ -238,6 +238,11 @@ class DremioMetricsCollector:
         # Track when terminal drain period started (0 = not in drain)
         self._drain_started_small: float = 0.0
         self._drain_started_large: float = 0.0
+        # Set to True once drain completes so we keep returning 0 while KEDA
+        # is still updating .spec.replicas (cooldown period can be up to 600s).
+        # Cleared the moment a new job becomes active again.
+        self._scaled_to_zero_small: bool = False
+        self._scaled_to_zero_large: bool = False
 
     def get(self) -> MetricsSnapshot:
         """Return last cached snapshot immediately (never blocks)."""
@@ -315,7 +320,13 @@ class DremioMetricsCollector:
         now = time.time()
         if small_jobs > 0 or reflection_jobs > 0:
             self._drain_started_small = 0.0
+            self._scaled_to_zero_small = False
             return max(current, max(dremio_desired, 1))
+        # Already decided to scale to zero — keep returning 0 until KEDA acts
+        # (cooldownPeriod can be hundreds of seconds; .spec.replicas won't drop
+        # to 0 until then, so we must not let a non-zero current restart drain).
+        if self._scaled_to_zero_small:
+            return 0
         secs_idle = now - self._last_active_small
         if current > 0 and secs_idle < SCALE_DOWN_GRACE_SECS:
             logger.info(
@@ -339,6 +350,7 @@ class DremioMetricsCollector:
                 return current
             logger.info("small tier drain complete (%.0fs), scaling to 0", drain_elapsed)
             self._drain_started_small = 0.0
+            self._scaled_to_zero_small = True
         return 0
 
     def _compute_desired_large(self, current: int, large_jobs: int, dremio_desired: int) -> int:
@@ -351,8 +363,12 @@ class DremioMetricsCollector:
         now = time.time()
         if large_jobs > 0:
             self._drain_started_large = 0.0
+            self._scaled_to_zero_large = False
             # dremio_desired is always 0 (metric not emitted by Dremio) — use 1 as floor
             return max(current, max(dremio_desired, 1))
+        # Already decided to scale to zero — keep returning 0 until KEDA acts.
+        if self._scaled_to_zero_large:
+            return 0
         secs_idle = now - self._last_active_large
         if current > 0 and secs_idle < SCALE_DOWN_GRACE_SECS:
             logger.info(
@@ -376,6 +392,7 @@ class DremioMetricsCollector:
                 return current
             logger.info("large tier drain complete (%.0fs), scaling to 0", drain_elapsed)
             self._drain_started_large = 0.0
+            self._scaled_to_zero_large = True
         return 0
 
 

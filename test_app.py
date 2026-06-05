@@ -372,6 +372,55 @@ class TestDrainGuard(unittest.TestCase):
         self.assertEqual(result, 1)
         self.assertEqual(c._drain_started_small, 0.0)  # drain not started
 
+    def test_scaled_to_zero_flag_prevents_drain_restart(self):
+        """After drain completes, subsequent calls with current>0 still return 0 (sticky flag).
+
+        This covers the KEDA cooldown window: .spec.replicas stays non-zero for
+        up to cooldownPeriod seconds after the exporter first reports 0. Without
+        the flag, every poll would see current>0 and restart the drain timer.
+        """
+        import app
+        c = self._make_collector()
+        c._last_active_small = 0.0
+        c._drain_started_small = time.time() - app.TERMINAL_DRAIN_SECS - 1
+
+        # First call: drain completes, flag is set, returns 0
+        result = c._compute_desired_small(current=2, small_jobs=0, reflection_jobs=0, dremio_desired=0)
+        self.assertEqual(result, 0)
+        self.assertTrue(c._scaled_to_zero_small)
+
+        # Subsequent calls with current still non-zero (KEDA hasn't acted yet):
+        # must return 0 immediately without restarting drain
+        for _ in range(3):
+            result = c._compute_desired_small(current=2, small_jobs=0, reflection_jobs=0, dremio_desired=0)
+            self.assertEqual(result, 0)
+            self.assertEqual(c._drain_started_small, 0.0)  # drain NOT restarted
+
+    def test_scaled_to_zero_flag_clears_on_new_jobs(self):
+        """Sticky flag is cleared immediately when a new job arrives."""
+        c = self._make_collector()
+        c._scaled_to_zero_small = True  # simulate post-drain state
+
+        result = c._compute_desired_small(current=0, small_jobs=1, reflection_jobs=0, dremio_desired=0)
+        self.assertGreaterEqual(result, 1)
+        self.assertFalse(c._scaled_to_zero_small)
+
+    def test_large_scaled_to_zero_flag_prevents_drain_restart(self):
+        """Large tier: sticky flag prevents drain restart during KEDA cooldown."""
+        import app
+        c = self._make_collector()
+        c._last_active_large = 0.0
+        c._drain_started_large = time.time() - app.TERMINAL_DRAIN_SECS - 1
+
+        result = c._compute_desired_large(current=4, large_jobs=0, dremio_desired=0)
+        self.assertEqual(result, 0)
+        self.assertTrue(c._scaled_to_zero_large)
+
+        for _ in range(3):
+            result = c._compute_desired_large(current=4, large_jobs=0, dremio_desired=0)
+            self.assertEqual(result, 0)
+            self.assertEqual(c._drain_started_large, 0.0)
+
 
 if __name__ == "__main__":
     unittest.main()
